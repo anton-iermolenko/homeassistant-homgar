@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import importlib.util
 import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,13 +24,76 @@ for candidate in (Path(__file__).resolve().parent, Path.cwd(), Path("/config")):
         break
 sys.path.insert(0, str(ROOT))
 
-from custom_components.homgar import number  # noqa: E402
-from custom_components.homgar.const import (  # noqa: E402
-    CONF_VALVE_DURATION_UNIT,
-    DEFAULT_VALVE_DURATION_UNIT,
-    VALVE_DURATION_UNIT_MINUTES,
-    VALVE_DURATION_UNIT_SECONDS,
-)
+
+def _install_homeassistant_stubs() -> None:
+    """Install minimal HA module stubs for importing number.py on a host."""
+    modules = {
+        "homeassistant": types.ModuleType("homeassistant"),
+        "homeassistant.components": types.ModuleType("homeassistant.components"),
+        "homeassistant.components.number": types.ModuleType("homeassistant.components.number"),
+        "homeassistant.config_entries": types.ModuleType("homeassistant.config_entries"),
+        "homeassistant.const": types.ModuleType("homeassistant.const"),
+        "homeassistant.core": types.ModuleType("homeassistant.core"),
+        "homeassistant.helpers": types.ModuleType("homeassistant.helpers"),
+        "homeassistant.helpers.entity_platform": types.ModuleType("homeassistant.helpers.entity_platform"),
+        "homeassistant.helpers.restore_state": types.ModuleType("homeassistant.helpers.restore_state"),
+        "homeassistant.helpers.update_coordinator": types.ModuleType("homeassistant.helpers.update_coordinator"),
+    }
+    for name, module in modules.items():
+        sys.modules.setdefault(name, module)
+
+    class _NumberEntity:
+        pass
+
+    class _ConfigEntry:
+        pass
+
+    class _HomeAssistant:
+        pass
+
+    class _RestoreEntity:
+        pass
+
+    class _CoordinatorEntity:
+        pass
+
+    modules["homeassistant.components.number"].NumberEntity = _NumberEntity
+    modules["homeassistant.components.number"].NumberMode = SimpleNamespace(BOX="box")
+    modules["homeassistant.config_entries"].ConfigEntry = _ConfigEntry
+    modules["homeassistant.const"].UnitOfTime = SimpleNamespace(SECONDS="s", MINUTES="min")
+    modules["homeassistant.core"].HomeAssistant = _HomeAssistant
+    modules["homeassistant.helpers.entity_platform"].AddEntitiesCallback = object
+    modules["homeassistant.helpers.restore_state"].RestoreEntity = _RestoreEntity
+    modules["homeassistant.helpers.update_coordinator"].CoordinatorEntity = _CoordinatorEntity
+
+
+def _load_module(module_name: str, relative_path: str):
+    path = ROOT / relative_path
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load module from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_install_homeassistant_stubs()
+sys.modules.setdefault("custom_components", types.ModuleType("custom_components"))
+homgar_pkg = sys.modules.setdefault("custom_components.homgar", types.ModuleType("custom_components.homgar"))
+homgar_pkg.__path__ = [str(ROOT / "custom_components" / "homgar")]
+
+const = _load_module("custom_components.homgar.const", "custom_components/homgar/const.py")
+_load_module("custom_components.homgar.decoder", "custom_components/homgar/decoder.py")
+coordinator_stub = types.ModuleType("custom_components.homgar.coordinator")
+coordinator_stub.HomGarCoordinator = object
+sys.modules["custom_components.homgar.coordinator"] = coordinator_stub
+number = _load_module("custom_components.homgar.number", "custom_components/homgar/number.py")
+
+CONF_VALVE_DURATION_UNIT = const.CONF_VALVE_DURATION_UNIT
+DEFAULT_VALVE_DURATION_UNIT = const.DEFAULT_VALVE_DURATION_UNIT
+VALVE_DURATION_UNIT_MINUTES = const.VALVE_DURATION_UNIT_MINUTES
+VALVE_DURATION_UNIT_SECONDS = const.VALVE_DURATION_UNIT_SECONDS
 
 PASS = 0
 FAIL = 0

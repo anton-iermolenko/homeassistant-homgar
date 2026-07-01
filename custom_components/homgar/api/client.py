@@ -327,6 +327,12 @@ class HomGarClient:
                 raise HomGarApiError(f"getDeviceStatus HTTP {resp.status}")
             data = await resp.json()
         _LOGGER.debug("API response: get_device_status data=%s", data)
+        if data.get("code") in (1001, 1004):
+            await self._reauth()
+            async with self._session.get(url, headers=self._auth_headers(), params=params) as resp2:
+                if resp2.status != 200:
+                    raise HomGarApiError(f"getDeviceStatus HTTP {resp2.status}")
+                data = await resp2.json()
         if data.get("code") != 0:
             raise HomGarApiError(f"getDeviceStatus failed: {data}")
         return data.get("data", {})
@@ -384,6 +390,12 @@ class HomGarClient:
                 raise HomGarApiError(f"subscribeStatus HTTP {resp.status}")
             data = await resp.json()
         _LOGGER.debug("API response: subscribe_status data=%s", data)
+        if data.get("code") in (1001, 1004):
+            await self._reauth()
+            async with self._session.post(url, headers=self._auth_headers(), json=payload) as resp2:
+                if resp2.status != 200:
+                    raise HomGarApiError(f"subscribeStatus HTTP {resp2.status}")
+                data = await resp2.json()
         if data.get("code") != 0:
             raise HomGarApiError(f"subscribeStatus failed: {data}")
         return data.get("data", {})

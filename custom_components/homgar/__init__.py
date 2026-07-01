@@ -33,11 +33,29 @@ _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[str] = ["sensor", "binary_sensor", "valve", "switch", "number"]
 _MQTT_RENEWAL_BACKOFF_SECONDS = (30, 60, 300, 900)
+_MQTT_RENEWAL_UNSUB_KEY = "_mqtt_renewal_unsub"
 
 
 def _select_mqtt_subscription_hid(hubs: list[dict], hids: list) -> int | str | None:
     """Prefer a selected home that actually has a hub for MQTT subscription."""
     return next((hub.get("hid") for hub in hubs if hub.get("hid")), hids[0] if hids else None)
+
+
+def _schedule_mqtt_renewal(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    delay: float,
+    action,
+) -> None:
+    """Schedule one MQTT renewal/retry callback and cancel any previous one."""
+    entry_data = hass.data.setdefault(DOMAIN, {}).setdefault(entry.entry_id, {})
+    previous_unsub = entry_data.get(_MQTT_RENEWAL_UNSUB_KEY)
+    if previous_unsub:
+        previous_unsub()
+
+    unsub = async_call_later(hass, delay, action)
+    entry_data[_MQTT_RENEWAL_UNSUB_KEY] = unsub
+    entry.async_on_unload(unsub)
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
@@ -94,6 +112,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Check if renewal was already scheduled by a previous setup (shouldn't happen, but safety check)
     already_scheduled = entry_data.get("_mqtt_renewal_scheduled", False)
     entry_data = {"_mqtt_renewal_scheduled": already_scheduled}  # Fresh dict, preserve flag
+    hass.data[DOMAIN][entry.entry_id] = entry_data
 
     # Initialize MQTT client object (connect happens below after hass.data is set)
     mqtt_client = None
@@ -145,15 +164,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                             expire_ts - now,
                             renew_in,
                         )
-                        # Prevent duplicate renewal schedules on reload
-                        if entry_data.get("_mqtt_renewal_scheduled"):
-                            _LOGGER.info("HomGar [%s]: MQTT renewal already scheduled, skipping duplicate", entry.title)
-                        else:
-                            entry_data["_mqtt_renewal_scheduled"] = True
-                            async def _renew_subscription(hass=hass, entry=entry):
-                                _LOGGER.info("HomGar [%s]: Renewing MQTT subscription (pre-expire renewal)", entry.title)
-                                await _async_renew_mqtt_subscription(hass, entry)
-                            hass.loop.call_later(renew_in, lambda: hass.async_create_task(_renew_subscription()))
+                        async def _renew_subscription(_now, hass=hass, entry=entry):
+                            _LOGGER.info("HomGar [%s]: Renewing MQTT subscription (pre-expire renewal)", entry.title)
+                            await _async_renew_mqtt_subscription(hass, entry)
+                        _schedule_mqtt_renewal(hass, entry, renew_in, _renew_subscription)
                     except Exception as renew_e:
                         _LOGGER.warning("HomGar [%s]: Failed to schedule MQTT renewal: %s", entry.title, renew_e)
 
@@ -488,9 +502,9 @@ async def _async_renew_mqtt_subscription(hass: HomeAssistant, entry: ConfigEntry
                     entry.title, renew_in
                 )
                 
-                async def _schedule_next_renewal(hass=hass, entry=entry):
+                async def _schedule_next_renewal(_now, hass=hass, entry=entry):
                     await _async_renew_mqtt_subscription(hass, entry)
-                hass.loop.call_later(renew_in, lambda: hass.async_create_task(_schedule_next_renewal()))
+                _schedule_mqtt_renewal(hass, entry, renew_in, _schedule_next_renewal)
             except Exception as sched_e:
                 _LOGGER.warning("HomGar [%s]: MQTT renewal - failed to schedule next renewal: %s", entry.title, sched_e)
         
@@ -508,10 +522,10 @@ async def _async_renew_mqtt_subscription(hass: HomeAssistant, entry: ConfigEntry
             retry_count + 1,
         )
 
-        async def _retry_renewal(hass=hass, entry=entry):
+        async def _retry_renewal(_now, hass=hass, entry=entry):
             await _async_renew_mqtt_subscription(hass, entry)
 
-        hass.loop.call_later(retry_in, lambda: hass.async_create_task(_retry_renewal()))
+        _schedule_mqtt_renewal(hass, entry, retry_in, _retry_renewal)
         return False
     except Exception as e:
         _LOGGER.error("HomGar [%s]: MQTT renewal failed: %s", entry.title, e, exc_info=True)
@@ -524,6 +538,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unload_ok:
         # Disconnect MQTT client if present
         entry_data = hass.data[DOMAIN].get(entry.entry_id, {})
+        renewal_unsub = entry_data.get(_MQTT_RENEWAL_UNSUB_KEY)
+        if renewal_unsub:
+            renewal_unsub()
         mqtt_client = entry_data.get("mqtt_client")
         if mqtt_client:
             _LOGGER.info("HomGar [%s]: Disconnecting MQTT client", entry.title)

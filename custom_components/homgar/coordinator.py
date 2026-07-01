@@ -204,6 +204,24 @@ class HomGarCoordinator(DataUpdateCoordinator):
                         status_array = device_data.get("subDeviceStatus", [])
                         status_by_mid[mid] = {"subDeviceStatus": status_array}
                         _LOGGER.debug("Fetched status for mid=%s using multipleDeviceStatus", mid)
+
+                    fetched_mids = {str(mid) for mid in status_by_mid}
+                    missing_hubs = [
+                        hub for hub in hubs
+                        if str(hub["mid"]) not in fetched_mids
+                    ]
+                    for hub in missing_hubs:
+                        mid = hub["mid"]
+                        try:
+                            status = await self._client.get_device_status(mid)
+                            status_by_mid[mid] = status
+                            _LOGGER.debug(
+                                "Fetched missing status for mid=%s using individual call",
+                                mid,
+                            )
+                        except Exception as individual_e:
+                            _LOGGER.error("Failed to get status for mid=%s: %s", mid, individual_e)
+                            status_by_mid[mid] = {"subDeviceStatus": []}
                         
                 except Exception as e:
                     _LOGGER.warning("multipleDeviceStatus failed, falling back to individual calls: %s", e)

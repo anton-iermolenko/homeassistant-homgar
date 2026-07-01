@@ -358,7 +358,9 @@ class HomGarGenericSensor(HomGarSensorBase):
         if value is not None and getattr(self, "_attr_device_class", None) == SensorDeviceClass.TIMESTAMP and isinstance(value, str):
             try:
                 value = datetime.fromisoformat(value)
-                raw_status = self._sensor_info.get("raw_status") or {}
+                sensors = self.coordinator.data.get("sensors", {})
+                info = sensors.get(self._sensor_key) or self._sensor_info
+                raw_status = info.get("raw_status") or {}
                 raw_payload = raw_status.get("value")
                 if (
                     self._field_name in _LOCAL_TLV_TIMESTAMP_FIELDS
