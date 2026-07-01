@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 import aiohttp
 
 _LOGGER = logging.getLogger(__name__)
+_AUTH_REJECTED_CODES = {1001, 1004}
 
 
 class HomGarApiError(Exception):
@@ -235,6 +236,35 @@ class HomGarClient:
         if not await self.login():
             raise HomGarApiError("Re-authentication failed")
 
+    def _is_auth_rejected_response(self, data: dict) -> bool:
+        """Return True when the API response means the token was rejected."""
+        return data.get("code") in _AUTH_REJECTED_CODES
+
+    async def _request_json_with_auth_retry(
+        self,
+        method: str,
+        url: str,
+        http_error: str,
+        request_kwargs_builder,
+    ) -> dict:
+        """Run an authenticated request and retry once after server token rejection."""
+
+        async def request_once() -> dict:
+            async with self._session.request(
+                method,
+                url,
+                **request_kwargs_builder(),
+            ) as resp:
+                if resp.status != 200:
+                    raise HomGarApiError(f"{http_error} HTTP {resp.status}")
+                return await resp.json()
+
+        data = await request_once()
+        if self._is_auth_rejected_response(data):
+            await self._reauth()
+            data = await request_once()
+        return data
+
     # --- API calls ---
 
     async def list_homes(self) -> list[dict]:
@@ -242,16 +272,14 @@ class HomGarClient:
         await self.ensure_logged_in()
         url = f"{self._base_url}/app/member/appHome/list"
         _LOGGER.debug("API call: list_homes URL=%s", url)
-        
-        async with self._session.get(url, headers=self._auth_headers()) as resp:
-            if resp.status != 200:
-                raise HomGarApiError(f"list_homes HTTP {resp.status}")
-            data = await resp.json()
-            _LOGGER.debug("API response: list_homes data=%s", data)
-        if data.get("code") in (1001, 1004):
-            await self._reauth()
-            async with self._session.get(url, headers=self._auth_headers()) as resp2:
-                data = await resp2.json()
+
+        data = await self._request_json_with_auth_retry(
+            "GET",
+            url,
+            "list_homes",
+            lambda: {"headers": self._auth_headers()},
+        )
+        _LOGGER.debug("API response: list_homes data=%s", data)
         if data.get("code") != 0:
             raise HomGarApiError(f"list_homes failed: {data}")
         return data.get("data", [])
@@ -262,15 +290,14 @@ class HomGarClient:
         url = f"{self._base_url}/app/device/getDeviceByHid"
         params = {"hid": hid}
         _LOGGER.debug("API call: get_devices_by_hid URL=%s params=%s", url, params)
-        async with self._session.get(url, headers=self._auth_headers(), params=params) as resp:
-            if resp.status != 200:
-                raise HomGarApiError(f"getDeviceByHid HTTP {resp.status}")
-            data = await resp.json()
+
+        data = await self._request_json_with_auth_retry(
+            "GET",
+            url,
+            "getDeviceByHid",
+            lambda: {"headers": self._auth_headers(), "params": params},
+        )
         _LOGGER.debug("API response: get_devices_by_hid data=%s", data)
-        if data.get("code") in (1001, 1004):
-            await self._reauth()
-            async with self._session.get(url, headers=self._auth_headers(), params=params) as resp2:
-                data = await resp2.json()
         if data.get("code") != 0:
             raise HomGarApiError(f"getDeviceByHid failed: {data}")
         return data.get("data", [])
@@ -291,15 +318,14 @@ class HomGarClient:
         
         payload = {"devices": device_list}
         _LOGGER.debug("API call: get_multiple_device_status URL=%s payload=%s", url, payload)
-        async with self._session.post(url, headers=self._auth_headers(), json=payload) as resp:
-            if resp.status != 200:
-                raise HomGarApiError(f"Failed to get device status: {resp.status}")
-            data = await resp.json()
+
+        data = await self._request_json_with_auth_retry(
+            "POST",
+            url,
+            "multipleDeviceStatus",
+            lambda: {"headers": self._auth_headers(), "json": payload},
+        )
         _LOGGER.debug("API response: get_multiple_device_status data=%s", data)
-        if data.get("code") in (1001, 1004):
-            await self._reauth()
-            async with self._session.post(url, headers=self._auth_headers(), json=payload) as resp2:
-                data = await resp2.json()
         if data.get("code") != 0:
             raise HomGarApiError(f"Device status API error: {data.get('msg')}")
         
@@ -322,17 +348,14 @@ class HomGarClient:
         url = f"{self._base_url}/app/device/getDeviceStatus"
         params = {"mid": mid}
         _LOGGER.debug("API call: get_device_status URL=%s params=%s", url, params)
-        async with self._session.get(url, headers=self._auth_headers(), params=params) as resp:
-            if resp.status != 200:
-                raise HomGarApiError(f"getDeviceStatus HTTP {resp.status}")
-            data = await resp.json()
+
+        data = await self._request_json_with_auth_retry(
+            "GET",
+            url,
+            "getDeviceStatus",
+            lambda: {"headers": self._auth_headers(), "params": params},
+        )
         _LOGGER.debug("API response: get_device_status data=%s", data)
-        if data.get("code") in (1001, 1004):
-            await self._reauth()
-            async with self._session.get(url, headers=self._auth_headers(), params=params) as resp2:
-                if resp2.status != 200:
-                    raise HomGarApiError(f"getDeviceStatus HTTP {resp2.status}")
-                data = await resp2.json()
         if data.get("code") != 0:
             raise HomGarApiError(f"getDeviceStatus failed: {data}")
         return data.get("data", {})
@@ -371,31 +394,36 @@ class HomGarClient:
             add_hid(hub.get("hid"))
         add_hid(hid)
 
-        payload = {
-            "hid": str(hid),
-            "hidList": selected_hids,
-            "subscribe": subscribe_list,
-            "unsubscribe": [],
-            "userInfo": {
-                "deviceName": self._mqtt_credentials.get("device_name", ""),
-                "deviceType": 1,
-                "notice": 0,
-                "productKey": self._mqtt_credentials.get("product_key", ""),
-                "pushId": _uuid.uuid4().hex,
-            },
-        }
+        def build_payload() -> dict:
+            return {
+                "hid": str(hid),
+                "hidList": selected_hids,
+                "subscribe": subscribe_list,
+                "unsubscribe": [],
+                "userInfo": {
+                    "deviceName": self._mqtt_credentials.get("device_name", ""),
+                    "deviceType": 1,
+                    "notice": 0,
+                    "productKey": self._mqtt_credentials.get("product_key", ""),
+                    "pushId": _uuid.uuid4().hex,
+                },
+            }
+
+        payload = build_payload()
         _LOGGER.debug("API call: subscribe_status URL=%s payload=%s", url, payload)
-        async with self._session.post(url, headers=self._auth_headers(), json=payload) as resp:
-            if resp.status != 200:
-                raise HomGarApiError(f"subscribeStatus HTTP {resp.status}")
-            data = await resp.json()
+
+        def build_request_kwargs() -> dict:
+            nonlocal payload
+            payload = build_payload()
+            return {"headers": self._auth_headers(), "json": payload}
+
+        data = await self._request_json_with_auth_retry(
+            "POST",
+            url,
+            "subscribeStatus",
+            build_request_kwargs,
+        )
         _LOGGER.debug("API response: subscribe_status data=%s", data)
-        if data.get("code") in (1001, 1004):
-            await self._reauth()
-            async with self._session.post(url, headers=self._auth_headers(), json=payload) as resp2:
-                if resp2.status != 200:
-                    raise HomGarApiError(f"subscribeStatus HTTP {resp2.status}")
-                data = await resp2.json()
         if data.get("code") != 0:
             raise HomGarApiError(f"subscribeStatus failed: {data}")
         return data.get("data", {})
@@ -411,13 +439,15 @@ class HomGarClient:
             "productKey": product_key,
             "status": state,
         }
-        async with self._session.post(url, headers=self._auth_headers(), json=payload) as resp:
-            if resp.status != 200:
-                raise HomGarApiError(f"Failed to set device state: {resp.status}")
-            data = await resp.json()
-            if data.get("code") != 0:
-                raise HomGarApiError(f"Set device state API error: {data.get('msg')}")
-            return True
+        data = await self._request_json_with_auth_retry(
+            "POST",
+            url,
+            "setDeviceStatus",
+            lambda: {"headers": self._auth_headers(), "json": payload},
+        )
+        if data.get("code") != 0:
+            raise HomGarApiError(f"Set device state API error: {data.get('msg')}")
+        return True
 
     async def get_product_models(self, version: int = 0) -> list[dict]:
         """Get full product model list from API.
@@ -538,10 +568,12 @@ class HomGarClient:
             payload["hid"] = str(hid)
         _LOGGER.debug("API call: control_work_mode URL=%s payload=%s", url, payload)
 
-        async with self._session.post(url, json=payload, headers=self._auth_headers()) as resp:
-            if resp.status != 200:
-                raise HomGarApiError(f"controlWorkMode HTTP {resp.status}")
-            data = await resp.json()
+        data = await self._request_json_with_auth_retry(
+            "POST",
+            url,
+            "controlWorkMode",
+            lambda: {"json": payload, "headers": self._auth_headers()},
+        )
 
         _LOGGER.debug("API response: control_work_mode data=%s", data)
 
@@ -583,16 +615,21 @@ class HomGarClient:
             duration=duration,
             dp_code=dp_code,
         )
-        headers = self._auth_headers()
-        if hid is not None:
-            headers["hid"] = str(hid)
+
+        def build_headers() -> dict:
+            headers = self._auth_headers()
+            if hid is not None:
+                headers["hid"] = str(hid)
+            return headers
 
         _LOGGER.debug("API call: control_work_mode_dp URL=%s payload=%s", url, payload)
 
-        async with self._session.post(url, json=payload, headers=headers) as resp:
-            if resp.status != 200:
-                raise HomGarApiError(f"controlWorkModeDP HTTP {resp.status}")
-            data = await resp.json()
+        data = await self._request_json_with_auth_retry(
+            "POST",
+            url,
+            "controlWorkModeDP",
+            lambda: {"json": payload, "headers": build_headers()},
+        )
 
         _LOGGER.debug("API response: control_work_mode_dp data=%s", data)
 

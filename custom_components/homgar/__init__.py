@@ -58,6 +58,32 @@ def _schedule_mqtt_renewal(
     entry.async_on_unload(unsub)
 
 
+def _schedule_mqtt_renewal_retry(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    entry_data: dict,
+    reason: str,
+) -> None:
+    """Schedule a backoff retry for MQTT renewal without reloading the entry."""
+    retry_count = int(entry_data.get("_mqtt_renewal_retry_count", 0))
+    retry_in = _MQTT_RENEWAL_BACKOFF_SECONDS[
+        min(retry_count, len(_MQTT_RENEWAL_BACKOFF_SECONDS) - 1)
+    ]
+    entry_data["_mqtt_renewal_retry_count"] = retry_count + 1
+    _LOGGER.warning(
+        "HomGar [%s]: MQTT renewal retrying in %ss (attempt %s): %s",
+        entry.title,
+        retry_in,
+        retry_count + 1,
+        reason,
+    )
+
+    async def _retry_renewal(_now, hass=hass, entry=entry):
+        await _async_renew_mqtt_subscription(hass, entry)
+
+    _schedule_mqtt_renewal(hass, entry, retry_in, _retry_renewal)
+
+
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """Legacy YAML setup - not used."""
     return True
@@ -440,6 +466,12 @@ async def _async_renew_mqtt_subscription(hass: HomeAssistant, entry: ConfigEntry
         # Extract credentials
         if not sub_creds.get("deviceName") or not sub_creds.get("deviceSecret"):
             _LOGGER.error("HomGar [%s]: MQTT renewal - incomplete credentials from subscribeStatus", entry.title)
+            _schedule_mqtt_renewal_retry(
+                hass,
+                entry,
+                entry_data,
+                "incomplete credentials from subscribeStatus",
+            )
             return False
             
         mqtt_host = sub_creds.get("mqttHostUrl", "")
@@ -452,11 +484,6 @@ async def _async_renew_mqtt_subscription(hass: HomeAssistant, entry: ConfigEntry
         product_key = sub_creds["productKey"]
         device_name = sub_creds["deviceName"]
         device_secret = sub_creds["deviceSecret"]
-        
-        # Disconnect old client
-        if old_mqtt_client:
-            _LOGGER.info("HomGar [%s]: MQTT renewal - disconnecting old client", entry.title)
-            await hass.async_add_executor_job(old_mqtt_client.disconnect)
         
         # Create new MQTT client with fresh credentials
         def on_mqtt_message(data: dict):
@@ -480,7 +507,19 @@ async def _async_renew_mqtt_subscription(hass: HomeAssistant, entry: ConfigEntry
         connected = await hass.async_add_executor_job(new_mqtt_client.connect)
         if not connected:
             _LOGGER.error("HomGar [%s]: MQTT renewal - failed to connect new client", entry.title)
+            await hass.async_add_executor_job(new_mqtt_client.disconnect)
+            _schedule_mqtt_renewal_retry(
+                hass,
+                entry,
+                entry_data,
+                "new MQTT client failed to connect",
+            )
             return False
+
+        # Disconnect old client only after the replacement is connected.
+        if old_mqtt_client:
+            _LOGGER.info("HomGar [%s]: MQTT renewal - disconnecting old client", entry.title)
+            await hass.async_add_executor_job(old_mqtt_client.disconnect)
             
         # Update hass.data with new client
         entry_data["mqtt_client"] = new_mqtt_client
@@ -511,24 +550,11 @@ async def _async_renew_mqtt_subscription(hass: HomeAssistant, entry: ConfigEntry
         return True
         
     except (asyncio.TimeoutError, ClientError) as e:
-        retry_count = int(entry_data.get("_mqtt_renewal_retry_count", 0))
-        retry_in = _MQTT_RENEWAL_BACKOFF_SECONDS[min(retry_count, len(_MQTT_RENEWAL_BACKOFF_SECONDS) - 1)]
-        entry_data["_mqtt_renewal_retry_count"] = retry_count + 1
-        _LOGGER.warning(
-            "HomGar [%s]: MQTT renewal timed out: %s; retrying in %ss (attempt %s)",
-            entry.title,
-            e,
-            retry_in,
-            retry_count + 1,
-        )
-
-        async def _retry_renewal(_now, hass=hass, entry=entry):
-            await _async_renew_mqtt_subscription(hass, entry)
-
-        _schedule_mqtt_renewal(hass, entry, retry_in, _retry_renewal)
+        _schedule_mqtt_renewal_retry(hass, entry, entry_data, f"timeout/network error: {e}")
         return False
     except Exception as e:
         _LOGGER.error("HomGar [%s]: MQTT renewal failed: %s", entry.title, e, exc_info=True)
+        _schedule_mqtt_renewal_retry(hass, entry, entry_data, f"unexpected error: {e}")
         return False
 
 

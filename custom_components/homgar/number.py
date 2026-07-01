@@ -265,6 +265,24 @@ class HomGarZoneDurationNumber(CoordinatorEntity, NumberEntity, RestoreEntity):
             self.async_write_ha_state()
             return
 
+        legacy_seconds = _duration_seconds_from_options(
+            self.coordinator,
+            self._storage_key,
+        )
+        if legacy_seconds is not None:
+            self._current_seconds = _clamp_duration_seconds(
+                legacy_seconds,
+                self._duration_unit,
+            )
+            await _async_save_duration_seconds(
+                self.hass,
+                self.coordinator._entry.entry_id,
+                self._storage_key,
+                self._current_seconds,
+            )
+            self.async_write_ha_state()
+            return
+
         last_state = await self.async_get_last_state()
         if last_state is not None:
             try:
