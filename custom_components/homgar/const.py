@@ -8,6 +8,7 @@ CONF_HIDS = "hids"  # list of selected home IDs
 CONF_APP_TYPE = "app_type"  # "homgar" or "rainpoint"
 CONF_GROUP_MULTI_ZONE_DEVICES = "group_multi_zone_devices"
 CONF_VALVE_DURATION_UNIT = "valve_duration_unit"
+CONF_VALVE_DURATIONS = "valve_durations"
 
 VALVE_DURATION_UNIT_MINUTES = "minutes"
 VALVE_DURATION_UNIT_SECONDS = "seconds"

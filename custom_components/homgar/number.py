@@ -14,6 +14,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import (
     DOMAIN,
     CONF_GROUP_MULTI_ZONE_DEVICES,
+    CONF_VALVE_DURATIONS,
     CONF_VALVE_DURATION_UNIT,
     DEFAULT_VALVE_DURATION_UNIT,
     VALVE_DURATION_UNIT_MINUTES,
@@ -35,6 +36,10 @@ DURATION_DEFAULT_SECONDS = 600
 DURATION_MIN_MINUTES = 1
 DURATION_MAX_MINUTES = 60
 DURATION_STEP_MINUTES = 1
+_DURATION_STORE_VERSION = 1
+_DURATION_STORE_KEY = "zone_durations"
+_DURATION_STORE_CACHE_KEY = "_zone_duration_cache"
+_DURATION_STORE_OBJECT_KEY = "_zone_duration_store"
 
 
 def _duration_unit_from_options(coordinator: HomGarCoordinator) -> str:
@@ -70,6 +75,95 @@ def _clamp_duration_seconds(seconds: int, unit: str) -> int:
     """Clamp a duration to the range representable by the configured unit."""
     minimum, maximum = _duration_bounds_seconds(unit)
     return min(max(seconds, minimum), maximum)
+
+
+def _duration_storage_key(mid: int | str, addr: int | str, zone_num: int) -> str:
+    """Return the stable storage key for a zone duration."""
+    return f"{mid}_{addr}_zone{zone_num}"
+
+
+def _duration_seconds_from_options(coordinator: HomGarCoordinator, key: str) -> int | None:
+    """Read a duration saved in older option-backed builds, if present."""
+    durations = coordinator._entry.options.get(CONF_VALVE_DURATIONS)
+    if not isinstance(durations, dict):
+        return None
+    try:
+        value = int(durations.get(key))
+    except (TypeError, ValueError):
+        return None
+    if DURATION_MIN_SECONDS <= value <= DURATION_MAX_SECONDS:
+        return value
+    return None
+
+
+def _duration_store_name(entry_id: str) -> str:
+    """Return the storage file name for saved zone durations."""
+    return f"{DOMAIN}_{entry_id}_{_DURATION_STORE_KEY}"
+
+
+async def _async_duration_cache(hass: HomeAssistant, entry_id: str) -> dict[str, int]:
+    """Load and cache persisted zone durations for this config entry."""
+    from homeassistant.helpers.storage import Store
+
+    entry_data = hass.data.setdefault(DOMAIN, {}).setdefault(entry_id, {})
+    cached = entry_data.get(_DURATION_STORE_CACHE_KEY)
+    if isinstance(cached, dict):
+        return cached
+
+    store = entry_data.get(_DURATION_STORE_OBJECT_KEY)
+    if store is None:
+        store = Store(hass, _DURATION_STORE_VERSION, _duration_store_name(entry_id))
+        entry_data[_DURATION_STORE_OBJECT_KEY] = store
+
+    loaded = await store.async_load()
+    durations = loaded.get(_DURATION_STORE_KEY, loaded) if isinstance(loaded, dict) else {}
+    if not isinstance(durations, dict):
+        durations = {}
+
+    clean: dict[str, int] = {}
+    for key, value in durations.items():
+        try:
+            seconds = int(value)
+        except (TypeError, ValueError):
+            continue
+        if DURATION_MIN_SECONDS <= seconds <= DURATION_MAX_SECONDS:
+            clean[str(key)] = seconds
+
+    entry_data[_DURATION_STORE_CACHE_KEY] = clean
+    return clean
+
+
+async def _async_save_duration_seconds(
+    hass: HomeAssistant,
+    entry_id: str,
+    key: str,
+    seconds: int,
+) -> None:
+    """Persist one zone duration immediately."""
+    from homeassistant.helpers.storage import Store
+
+    entry_data = hass.data.setdefault(DOMAIN, {}).setdefault(entry_id, {})
+    cache = await _async_duration_cache(hass, entry_id)
+    cache[key] = int(seconds)
+
+    store = entry_data.get(_DURATION_STORE_OBJECT_KEY)
+    if store is None:
+        store = Store(hass, _DURATION_STORE_VERSION, _duration_store_name(entry_id))
+        entry_data[_DURATION_STORE_OBJECT_KEY] = store
+    await store.async_save({_DURATION_STORE_KEY: cache})
+
+
+async def async_get_saved_duration_seconds(
+    hass: HomeAssistant,
+    entry_id: str,
+    mid: int | str,
+    addr: int | str,
+    zone_num: int,
+) -> int | None:
+    """Return a persisted zone duration in seconds, if one exists."""
+    key = _duration_storage_key(mid, addr, zone_num)
+    cache = await _async_duration_cache(hass, entry_id)
+    return cache.get(key)
 
 
 async def async_setup_entry(
@@ -145,8 +239,12 @@ class HomGarZoneDurationNumber(CoordinatorEntity, NumberEntity, RestoreEntity):
         mid = sensor_info["mid"]
         addr = sensor_info["addr"]
         sub_name = sensor_info.get("sub_name") or f"Valve Hub {addr}"
+        self._storage_key = _duration_storage_key(mid, addr, zone_num)
 
         self._attr_unique_id = f"rainpoint_{mid}_{addr}_zone{zone_num}_duration"
+        saved_seconds = _duration_seconds_from_options(coordinator, self._storage_key)
+        if saved_seconds is not None:
+            self._current_seconds = _clamp_duration_seconds(saved_seconds, self._duration_unit)
         self._attr_name = format_port_entity_name(
             sub_name,
             sensor_info,
@@ -160,6 +258,13 @@ class HomGarZoneDurationNumber(CoordinatorEntity, NumberEntity, RestoreEntity):
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
+        cache = await _async_duration_cache(self.hass, self.coordinator._entry.entry_id)
+        saved_seconds = cache.get(self._storage_key)
+        if saved_seconds is not None:
+            self._current_seconds = _clamp_duration_seconds(saved_seconds, self._duration_unit)
+            self.async_write_ha_state()
+            return
+
         last_state = await self.async_get_last_state()
         if last_state is not None:
             try:
@@ -170,14 +275,20 @@ class HomGarZoneDurationNumber(CoordinatorEntity, NumberEntity, RestoreEntity):
                 else:
                     # Legacy duration entities were always stored as minutes.
                     restored_seconds = int(restored * 60)
-                self._current_seconds = _clamp_duration_seconds(
-                    restored_seconds,
-                    self._duration_unit,
-                )
                 if DURATION_MIN_SECONDS <= restored_seconds <= DURATION_MAX_SECONDS:
+                    self._current_seconds = _clamp_duration_seconds(
+                        restored_seconds,
+                        self._duration_unit,
+                    )
                     _LOGGER.debug(
                         "Restored duration for %s: %ss",
                         self._attr_unique_id, self._current_seconds,
+                    )
+                    await _async_save_duration_seconds(
+                        self.hass,
+                        self.coordinator._entry.entry_id,
+                        self._storage_key,
+                        self._current_seconds,
                     )
             except (ValueError, TypeError):
                 pass
@@ -189,6 +300,12 @@ class HomGarZoneDurationNumber(CoordinatorEntity, NumberEntity, RestoreEntity):
     async def async_set_native_value(self, value: float) -> None:
         seconds = _duration_seconds_from_native(float(value), self._duration_unit)
         self._current_seconds = _clamp_duration_seconds(seconds, self._duration_unit)
+        await _async_save_duration_seconds(
+            self.hass,
+            self.coordinator._entry.entry_id,
+            self._storage_key,
+            self._current_seconds,
+        )
         self.async_write_ha_state()
 
     @property

@@ -8,8 +8,9 @@ from homeassistant.components.valve import (
     ValveEntityFeature,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
@@ -30,6 +31,7 @@ _LOGGER = logging.getLogger(__name__)
 
 # Default run duration used when HA opens a valve without a duration entity.
 DEFAULT_DURATION_SECONDS = 600  # 10 minutes
+COMPLETION_REFRESH_GRACE_SECONDS = 5
 
 
 async def async_setup_entry(
@@ -81,6 +83,8 @@ class HomGarValveEntity(CoordinatorEntity, ValveEntity):
         self._sensor_key = sensor_key
         self._sensor_info = sensor_info
         self._zone_num = zone_num
+        self._completion_unsub: CALLBACK_TYPE | None = None
+        self._completion_generation = 0
 
         hid = sensor_info["hid"]
         mid = sensor_info["mid"]
@@ -99,6 +103,11 @@ class HomGarValveEntity(CoordinatorEntity, ValveEntity):
             "Valve" if grouped else None,
             use_device_prefix=grouped,
         )
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Cancel pending local completion checks when HA unloads the entity."""
+        self._cancel_completion_check()
+        await super().async_will_remove_from_hass()
 
     # ------------------------------------------------------------------
     # Coordinator data helpers
@@ -211,11 +220,64 @@ class HomGarValveEntity(CoordinatorEntity, ValveEntity):
     # Control
     # ------------------------------------------------------------------
 
-    def _get_configured_duration_seconds(self) -> int:
+    def _cancel_completion_check(self) -> None:
+        """Cancel any pending HA-started run completion check."""
+        self._completion_generation += 1
+        if self._completion_unsub is not None:
+            self._completion_unsub()
+            self._completion_unsub = None
+
+    def _schedule_completion_check(self, duration: int) -> None:
+        """Refresh after a HA-started run should have ended.
+
+        RainPoint does not always publish the stop promptly.  This gives
+        MQTT/cloud one more chance to report the real idle state without
+        masking a valve that still reports open.
+        """
+        if self._completion_unsub is not None:
+            self._completion_unsub()
+            self._completion_unsub = None
+        self._completion_generation += 1
+        generation = self._completion_generation
+        delay = max(1, int(duration)) + COMPLETION_REFRESH_GRACE_SECONDS
+
+        def _run_check(_now) -> None:
+            self._completion_unsub = None
+            self.hass.async_create_task(
+                self._async_handle_completion_check(generation)
+            )
+
+        self._completion_unsub = async_call_later(self.hass, delay, _run_check)
+
+    async def _async_handle_completion_check(self, generation: int) -> None:
+        """Refresh after a requested duration without inventing device state."""
+        if generation != self._completion_generation:
+            return
+        try:
+            await self.coordinator.async_request_refresh()
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug(
+                "Completion refresh failed for key=%s zone=%s: %s",
+                self._sensor_key,
+                self._zone_num,
+                exc,
+            )
+
+        if generation != self._completion_generation:
+            return
+        port = self._port_data
+        if port and port.get("is_watering") is True:
+            _LOGGER.debug(
+                "Valve still reports open after requested duration: key=%s zone=%s",
+                self._sensor_key,
+                self._zone_num,
+            )
+
+    async def _get_configured_duration_seconds(self) -> int:
         """Look up the companion duration number entity and convert its value to seconds.
 
         Falls back to DEFAULT_DURATION_SECONDS
-        if the entity is not yet available.
+        if neither the entity nor persisted integration storage is available.
 
         Uses the entity registry to resolve unique_id -> entity_id so the lookup
         is not sensitive to HA auto-generated entity_id naming."""
@@ -239,6 +301,24 @@ class HomGarValveEntity(CoordinatorEntity, ValveEntity):
                     return max(1, int(value * 60))
                 except (ValueError, TypeError):
                     pass
+        try:
+            from .number import async_get_saved_duration_seconds
+
+            saved_seconds = await async_get_saved_duration_seconds(
+                self.hass,
+                self.coordinator._entry.entry_id,
+                mid,
+                addr,
+                self._zone_num,
+            )
+            if saved_seconds is not None:
+                return max(1, int(saved_seconds))
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug(
+                "Could not read saved duration for unique_id=%s: %s",
+                unique_id,
+                exc,
+            )
         _LOGGER.debug(
             "Duration entity for unique_id=%s not found, falling back to default %ss",
             unique_id, DEFAULT_DURATION_SECONDS,
@@ -307,7 +387,7 @@ class HomGarValveEntity(CoordinatorEntity, ValveEntity):
         if "duration" in kwargs:
             duration = int(kwargs["duration"])
         else:
-            duration = self._get_configured_duration_seconds()
+            duration = await self._get_configured_duration_seconds()
         mid = self._sensor_info["mid"]
         addr = self._sensor_info["addr"]
         
@@ -352,9 +432,11 @@ class HomGarValveEntity(CoordinatorEntity, ValveEntity):
         
         # OPTIMISTIC LOCAL UPDATE to prevent UI desync
         self._apply_optimistic_port_update(True, duration)
+        self._schedule_completion_check(duration)
         return
 
     async def async_close_valve(self, **kwargs: Any) -> None:
+        self._cancel_completion_check()
         mid = self._sensor_info["mid"]
         addr = self._sensor_info["addr"]
         
